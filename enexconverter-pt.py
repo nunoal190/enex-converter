@@ -46,7 +46,10 @@ def seguro(texto, padrao):
 class Nomes:
     """Reserva nomes sem distinguir maiúsculas, mesmo num disco Linux."""
 
-    def __init__(self):
+    def __init__(self, pasta):
+        self.limit = 220
+        if os.name == "nt":
+            self.limit = min(220, 258 - len(str(pasta.absolute()).encode("utf-16-le")) // 2)
         self.usados = set()
         self.proximo = {}
 
@@ -56,7 +59,9 @@ class Nomes:
         while True:
             fim = (f" ({numero})" if numero > 1 else "") + extensao
             # Limite conservador por componente, também válido em UTF-16.
-            inicio = base.encode("utf-8")[:220 - len(fim.encode("utf-8"))]
+            if self.limit <= len(fim.encode("utf-8")):
+                raise OSError("Pasta de destino demasiado longa. Escolha um caminho mais curto.")
+            inicio = base.encode("utf-8")[:self.limit - len(fim.encode("utf-8"))]
             nome = inicio.decode("utf-8", "ignore").rstrip(". ") + fim
             numero += 1
             if nome.casefold() not in self.usados:
@@ -212,7 +217,7 @@ def converter(origem, pasta_destino=None, emitir=consola):
     parcial.mkdir()  # Uma interrupção deixa o trabalho recuperável nesta pasta.
     anexos = parcial / "_anexos"
     anexos.mkdir()
-    paginas, ficheiros = Nomes(), Nomes()
+    paginas, ficheiros = Nomes(parcial), Nomes(anexos)
     notas = total_anexos = avisos = 0
     recursos = []
 
