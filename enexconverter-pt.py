@@ -219,7 +219,73 @@ def render_tasks(body, note):
                 checkbox(ET.SubElement(body, "p"), task, description)
 
 
-def escrever_nota(nota, recursos, pasta, nomes, avisar):
+def markdown_text(value):
+    return re.sub(r"([\\\[\]*_])", r"\\\1", re.sub(r"\s+", " ", value or ""))
+
+
+def markdown_body(node):
+    tag = node.tag
+    if tag in ("style", "script"):
+        return ""
+    if tag in ("pre", "code"):
+        raw = "".join(node.itertext())
+        fence = "`" * max(3 if tag == "pre" else 1,
+                             1 + max((len(m) for m in re.findall(r"`+", raw)), default=0))
+        if tag == "pre":
+            return f"\n\n{fence}\n{raw}\n{fence}\n\n"
+        return f"{fence} {raw} {fence}"
+    if tag == "table":
+        rows = []
+        for row in node.iter("tr"):
+            cells = [re.sub(r"\s+", " ", markdown_body(cell)).strip().replace("|", r"\|")
+                     for cell in row if cell.tag in ("td", "th")]
+            if cells:
+                rows.append(cells)
+        if not rows:
+            return ""
+        width = max(map(len, rows))
+        rows.insert(1, ["---"] * width)
+        return "\n\n" + "\n".join("| " + " | ".join(row + [""] * (width - len(row))) + " |"
+                                   for row in rows) + "\n\n"
+    if tag in ("ul", "ol"):
+        lines = []
+        for i, item in enumerate((child for child in node if child.tag == "li"), 1):
+            marker = "- " if tag == "ul" else f"{i}. "
+            value = markdown_body(item).strip().replace("\n", "\n" + " " * len(marker))
+            lines.append(marker + value[2:] if value.startswith(("- [x]", "- [ ]")) else marker + value)
+        return "\n\n" + "\n".join(lines) + "\n\n"
+
+    value = markdown_text(node.text) + "".join(markdown_body(child) + markdown_text(child.tail) for child in node)
+    if tag == "img":
+        url = node.get("src", "")
+        return f"![{url}]({url})"
+    if tag == "a" and node.get("href"):
+        url = node.get("href").replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+        label = re.sub(r"^📎 (?:Anexo|Attachment): ", "📎 ", value)
+        return f"[{label or url}]({url})"
+    if tag == "input" and node.get("type") == "checkbox":
+        return "- [x]" if "checked" in node.attrib else "- [ ]"
+    if tag == "br":
+        return "  \n"
+    if tag in ("s", "del", "strike"):
+        return "~~" + value + "~~"
+    if tag in ("strong", "b") or re.search(r"font-weight:\s*(bold|[7-9]00)", node.get("style", ""), re.I):
+        value = "**" + value.strip() + "**"
+    if tag in ("em", "i"):
+        return "*" + value + "*"
+    if re.fullmatch(r"h[1-6]", tag):
+        return "\n\n" + "#" * int(tag[1]) + " " + value.strip() + "\n\n"
+    if tag in ("div", "p", "blockquote"):
+        value = value.strip()
+        if not value:
+            return ""
+        if tag == "blockquote":
+            value = "> " + value.replace("\n", "\n> ")
+        return "\n\n" + value + "\n\n"
+    return value
+
+
+def escrever_nota(nota, recursos, pasta, nomes, avisar, markdown=False):
     titulo = nota.findtext("title", "").strip() or "Sem título"
     conteudo = nota.findtext("content", "").strip()
     try:
@@ -257,6 +323,12 @@ def escrever_nota(nota, recursos, pasta, nomes, avisar):
         if nome not in usados:
             ligacao(ET.SubElement(ET.SubElement(corpo, "p"), "a"), nome)
     render_tasks(corpo, nota)
+    if markdown:
+        caminho = pasta / nomes.reservar(seguro(titulo, "Sem título"), ".md")
+        with caminho.open("x", encoding="utf-8") as output:
+            output.write("# " + markdown_text(titulo) + "\n\n" + markdown_body(corpo).strip() + "\n")
+        return caminho.name
+
 
     raiz = ET.Element("html")
     head = ET.SubElement(raiz, "head")
@@ -281,7 +353,7 @@ def consola(tipo, mensagem, valor=0):
         print(mensagem, file=sys.stderr if tipo in ("aviso", "erro") else sys.stdout, flush=True)
 
 
-def converter(origem, pasta_destino=None, emitir=consola):
+def converter(origem, pasta_destino=None, emitir=consola, markdown=False):
     pasta = origem.parent if pasta_destino is None else pasta_destino
     pasta.mkdir(parents=True, exist_ok=True)
     destino = pasta / origem.stem
@@ -321,7 +393,7 @@ def converter(origem, pasta_destino=None, emitir=consola):
                 pilha[-2].remove(elem)
             elif len(pilha) == 2:
                 if elem.tag == "note":
-                    pagina = escrever_nota(elem, recursos, parcial, paginas, avisar)
+                    pagina = escrever_nota(elem, recursos, parcial, paginas, avisar, markdown)
                     recursos.clear()
                     notas += 1
                     # O parser lê por blocos. Reservar o último passo para a publicação.
@@ -353,12 +425,12 @@ def listar_entradas(caminhos):
     return list(entradas.values())
 
 
-def converter_lote(entradas, destino=None, emitir=consola):
+def converter_lote(entradas, destino=None, emitir=consola, markdown=False):
     notas = anexos = avisos = falhas = 0
     for indice, entrada in enumerate(entradas, 1):
         emitir("inicio", f"[{indice}/{len(entradas)}] v1.2 · A converter {entrada}")
         try:
-            n, a, v = converter(entrada, destino, emitir)
+            n, a, v = converter(entrada, destino, emitir, markdown)
             notas += n
             anexos += a
             avisos += v
@@ -413,7 +485,10 @@ class JanelaConversao:
         procurar.pack(side="left", padx=(6, 0))
         self.iniciar_btn = ttk.Button(painel, text="Iniciar Conversão", command=self.iniciar, state="disabled")
         self.iniciar_btn.grid(row=5, column=0, sticky="ew", pady=12)
-        self.controlos = (ficheiros, pasta, campo, procurar, self.iniciar_btn)
+        self.markdown = tk.BooleanVar(value=False)
+        format_box = ttk.Checkbutton(painel, text="Markdown (.md)", variable=self.markdown)
+        format_box.grid(row=10, column=0, sticky="w")
+        self.controlos = (format_box, ficheiros, pasta, campo, procurar, self.iniciar_btn)
         self.barra = ttk.Progressbar(painel, mode="determinate")
         self.barra.grid(row=6, column=0, sticky="ew")
         ttk.Label(painel, textvariable=self.estado).grid(row=7, column=0, sticky="w", pady=4)
@@ -455,11 +530,11 @@ class JanelaConversao:
         self.log.configure(state="disabled")
         for controlo in self.controlos:
             controlo.state(["disabled"])
-        threading.Thread(target=self.trabalhar, args=(self.caminhos, Path(destino) if destino else None),
+        threading.Thread(target=self.trabalhar, args=(self.caminhos, Path(destino) if destino else None, self.markdown.get()),
                          name="conversor-enex").start()
         self.raiz.after(40, self.atualizar)
 
-    def trabalhar(self, caminhos, destino):
+    def trabalhar(self, caminhos, destino, markdown=False):
         # A thread só comunica pela fila. Toda a interação com Tcl/Tk fica na thread principal.
         def emitir(tipo, mensagem, valor=0):
             self.eventos.put((tipo, mensagem, valor))
@@ -467,7 +542,7 @@ class JanelaConversao:
         try:
             entradas = listar_entradas(caminhos)
             emitir("lote", "", len(entradas))
-            resultado = converter_lote(entradas, destino, emitir)
+            resultado = converter_lote(entradas, destino, emitir, markdown)
             estado = "Concluído com avisos ou erros" if resultado else "Concluído"
         except Exception as erro:
             emitir("erro", str(erro))
@@ -525,7 +600,7 @@ class JanelaConversao:
 
 
 def main(args):
-    uso = ("Uso: python enex_para_html.py [ficheiro.enex | pasta] ...\n"
+    uso = ("Uso: python enexconverter-pt.py [--markdown] [ficheiro.enex | pasta] ...\n"
            "Sem argumentos: abre a interface gráfica. Use . para converter a pasta atual na consola.")
     if not args:
         try:
@@ -544,12 +619,15 @@ def main(args):
     if args in (["-h"], ["--help"]):
         print(uso)
         return 0
+    markdown = "--markdown" in args
+    if markdown:
+        args = [arg for arg in args if arg != "--markdown"] or ["."]
     try:
         entradas = listar_entradas(args)
     except (OSError, ValueError) as erro:
         print(erro, file=sys.stderr)
         return 2
-    return converter_lote(entradas)
+    return converter_lote(entradas, markdown=markdown)
 
 
 if __name__ == "__main__":
