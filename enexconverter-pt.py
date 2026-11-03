@@ -143,6 +143,82 @@ def ler_enml(conteudo):
     return ET.fromstring(re.sub(padrao, entidade, conteudo, flags=re.S))
 
 
+def render_tasks(body, note):
+    def field(task, *names):
+        for name in names:
+            value = task.get(name) or task.findtext(name)
+            if value and value.strip():
+                return value.strip()
+        return ""
+
+    records = {}
+    tasks = note.findall(".//task") + note.findall(".//en-task")
+    for task in tasks:
+        key = field(task, "taskId", "taskGuid", "guid", "id")
+        if key:
+            records[key] = task
+
+    def checkbox(row, task, description):
+        state = field(task, "taskStatus", "status", "checked", "completed").lower()
+        control = ET.SubElement(row, "input", type="checkbox", disabled="disabled")
+        if state in ("true", "1", "completed", "done"):
+            control.set("checked", "checked")
+            control.tail = " "
+            ET.SubElement(row, "s").text = description
+        else:
+            control.tail = " " + description
+
+    # Match the warning as a pair so an unrelated heading is retained.
+    parents = {child: parent for parent in body.iter() for child in parent}
+    cleared = set()
+    blocks = list(body.iter())
+    for i, block in enumerate(blocks):
+        for attr in ("text", "tail"):
+            value = getattr(block, attr) or ""
+            if value.strip().casefold().startswith(("este bloco é um espaço reservado para tarefas",
+                                                     "this block is a placeholder for tasks")):
+                setattr(block, attr, "")
+                cleared.add(block)
+                for previous in reversed(blocks[:i + 1]):
+                    heading = (previous.text or "").strip().casefold()
+                    if heading in ("conteúdo não suportado", "unsupported content"):
+                        previous.text = ""
+                        cleared.add(previous)
+                        break
+                    if previous is not block and heading:
+                        break
+
+    for node in cleared:
+        while node in parents and not len(node) and not (node.text or "").strip() and not (node.tail or "").strip():
+            parent = parents[node]
+            if node in parent:
+                parent.remove(node)
+            node = parent
+
+    used = set()
+    for parent in list(body.iter()):
+        for index, child in enumerate(list(parent)):
+            tag = child.tag
+            if tag not in ("en-task", "en-todo"):
+                continue
+            key = field(child, "taskId", "taskGuid", "guid", "id")
+            task = records.get(key, child)
+            used.add(task)
+            description = field(task, "title", "taskTitle", "description", "text") or (task.text or "").strip()
+            inline = tag == "en-todo" and not description
+            row = ET.Element("span" if parent.tag == "p" or (inline and (len(parent) > 1 or (parent.text or "").strip())) else "p")
+            checkbox(row, task, (child.tail or "").lstrip() if inline else description)
+            row.tail = None if inline else child.tail
+            parent.remove(child)
+            parent.insert(index, row)
+
+    for task in tasks:
+        if task not in used:
+            description = field(task, "title", "taskTitle", "description", "text") or (task.text or "").strip()
+            if description:
+                checkbox(ET.SubElement(body, "p"), task, description)
+
+
 def escrever_nota(nota, recursos, pasta, nomes, avisar):
     titulo = nota.findtext("title", "").strip() or "Sem título"
     conteudo = nota.findtext("content", "").strip()
@@ -180,12 +256,7 @@ def escrever_nota(nota, recursos, pasta, nomes, avisar):
     for _, (nome, _) in recursos:
         if nome not in usados:
             ligacao(ET.SubElement(ET.SubElement(corpo, "p"), "a"), nome)
-    for caixa in corpo.iter("en-todo"):
-        marcada = caixa.get("checked", "").lower() == "true"
-        caixa.tag = "input"
-        caixa.attrib = {"type": "checkbox", "disabled": "disabled"}
-        if marcada:
-            caixa.set("checked", "checked")
+    render_tasks(corpo, nota)
 
     raiz = ET.Element("html")
     head = ET.SubElement(raiz, "head")
