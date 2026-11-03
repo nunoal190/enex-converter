@@ -1,5 +1,6 @@
 """Converte exportações Evernote em cadernos HTML locais. Requer Python 3.8+."""
 
+from xml.parsers import expat
 import base64
 import hashlib
 import os
@@ -385,6 +386,154 @@ def consola(tipo, mensagem, valor=0):
         print(mensagem, file=sys.stderr if tipo in ("aviso", "erro") else sys.stdout, flush=True)
 
 
+class RecoveryReader:
+    """Read from the original file with an optional virtual root and one byte edit."""
+    def __init__(self, stream, prefix=b"", edit=None):
+        self.stream, self.prefix, self.edit = stream, prefix, edit
+
+    def read(self, size):
+        start = self.stream.tell()
+        data = self.stream.read(size)
+        if self.edit and start <= self.edit[0] < start + len(data):
+            pos, replacement = self.edit
+            index = pos - start
+            data = data[:index] + replacement + data[index + 1:]
+        result = self.prefix + data
+        self.prefix = b""
+        return result
+
+
+def diagnose(stream, start, prefix, edit):
+    stream.seek(start)
+    reader = RecoveryReader(stream, prefix, edit)
+    parser = expat.ParserCreate()
+    stack = []
+    note_start = None
+
+    def opened(tag, attrs):
+        nonlocal note_start
+        if stack == ["en-export"] and tag == "note":
+            note_start = start + parser.CurrentByteIndex - len(prefix)
+            if edit and note_start > edit[0]:
+                note_start -= len(edit[1]) - 1
+        stack.append(tag)
+
+    def closed(tag):
+        nonlocal note_start
+        stack.pop()
+        if stack == ["en-export"]:
+            note_start = None
+
+    parser.StartElementHandler = opened
+    parser.EndElementHandler = closed
+    try:
+        while True:
+            chunk = reader.read(65536)
+            parser.Parse(chunk, not chunk)
+            if not chunk:
+                raise ValueError("XML diagnostic failed")
+    except expat.ExpatError as error:
+        pos = start + parser.ErrorByteIndex - len(prefix)
+        if edit and pos > edit[0]:
+            pos -= len(edit[1]) - 1
+        return note_start, pos, stack[-1] if stack else "?", error.code
+
+
+def repair_candidate(stream, pos):
+    begin = max(0, pos - 128)
+    stream.seek(begin)
+    sample = stream.read(pos - begin + 64)
+    index = pos - begin
+    byte = sample[index:index + 1]
+    if byte and byte[0] < 32 and byte not in (b"\t", b"\r", b"\n"):
+        return (pos, b""), f"U+{byte[0]:04X}"
+    # Expat often points just after the ampersand (e.g. the space in 'A & B').
+    match = re.search(rb"&[A-Za-z0-9_.:-]*$", sample[:index])
+    if byte == b"&" or match:
+        amp = index if byte == b"&" else match.start()
+        return (begin + amp, b"&amp;"), "& → &amp;"
+    return None, f"byte 0x{byte.hex()}"
+
+
+def valid_repaired_note(stream, start, edit):
+    class NoteEnd(Exception):
+        pass
+
+    parser = expat.ParserCreate()
+    depth = 0
+    def opened(tag, attrs):
+        nonlocal depth
+        if depth == 1 and tag == "note":
+            raise ValueError("nested note")
+        depth += 1
+
+    def closed(tag):
+        nonlocal depth
+        depth -= 1
+        if not depth:
+            raise NoteEnd()
+
+    parser.StartElementHandler, parser.EndElementHandler = opened, closed
+    stream.seek(start)
+    reader = RecoveryReader(stream, edit=edit)
+    try:
+        while True:
+            chunk = reader.read(65536)
+            parser.Parse(chunk, not chunk)
+            if not chunk:
+                return False
+    except NoteEnd:
+        return True
+    except (expat.ExpatError, ValueError):
+        return False
+
+
+def recoverable_events(stream, recover, directory, stats):
+    prefix, edit = b"", None
+    while True:
+        start = stream.tell()
+        try:
+            yield from ET.iterparse(RecoveryReader(stream, prefix, edit), events=("start", "end"))
+            return
+        except ET.ParseError as error:
+            first, pos, expected, code = diagnose(stream, start, prefix, edit)
+            if first is None or pos < first:
+                raise
+            candidate, detail = repair_candidate(stream, pos)
+            if code == expat.errors.codes[expat.errors.XML_ERROR_TAG_MISMATCH]:
+                stream.seek(max(0, pos - 2))
+                tag = re.match(rb"</([\w:.-]+)", stream.read(128))
+                detail = f"esperado </{expected}>, encontrado </{tag[1].decode('ascii') if tag else '?'}>"
+            if code == expat.errors.codes[expat.errors.XML_ERROR_INVALID_TOKEN] and candidate and valid_repaired_note(stream, first, candidate):
+                recover(f"{error}; byte {pos}; {detail}; REPARADA")
+                stats[0] += 1
+                stream.seek(first)
+                prefix, edit = b"<en-export>", candidate
+                continue
+
+            # Preserve the original bytes. Resume only at a standalone ENEX boundary.
+            stream.seek(pos)
+            at_start = False
+            while True:
+                boundary = stream.tell()
+                chunk = stream.readline(65536)
+                if not chunk or (at_start and chunk.strip() in (b"<note>", b"</en-export>")):
+                    break
+                at_start = chunk.endswith(b"\n")
+            directory.mkdir(exist_ok=True)
+            fragment = directory / f"note-{first}.xml.fragment"
+            stream.seek(first)
+            with fragment.open("xb") as output:
+                while stream.tell() < boundary:
+                    output.write(stream.read(min(65536, boundary - stream.tell())))
+            recover(f"{error}; byte {pos}; {detail}; FRAGMENTO {directory.name}/{fragment.name}")
+            stats[1] += 1
+            if not chunk:
+                raise
+            stream.seek(boundary)
+            prefix, edit = b"<en-export>", None
+
+
 def converter(origem, pasta_destino=None, emitir=consola, markdown=False):
     pasta = origem.parent if pasta_destino is None else pasta_destino
     pasta.mkdir(parents=True, exist_ok=True)
@@ -399,15 +548,27 @@ def converter(origem, pasta_destino=None, emitir=consola, markdown=False):
     notas = total_anexos = avisos = 0
     recursos = []
 
+    stats = [0, 0]  # Repaired notes, archived fragments
+
     def avisar(msg):
         nonlocal avisos
         avisos += 1
-        emitir("aviso", f"{origem.name}, nota {notas + 1}: {msg}")
+        emitir("aviso", f"{origem.name}, nota {notas + stats[1] + 1}: {msg}")
 
     with origem.open("rb") as entrada:
         tamanho = max(1, os.fstat(entrada.fileno()).st_size)
         pilha = []
-        for evento, elem in ET.iterparse(entrada, events=("start", "end")):
+        def recover(error):
+            nonlocal total_anexos
+            title = pilha[1].findtext("title") if len(pilha) > 1 else None
+            avisar(f"{title or '?'} — {error}")
+            for _, (name, _) in recursos:
+                (anexos / name).unlink()
+            total_anexos -= len(recursos)
+            recursos.clear()
+            pilha.clear()
+
+        for evento, elem in recoverable_events(entrada, recover, parcial / "_recovery", stats):
             if evento == "start":
                 if not pilha and elem.tag != "en-export":
                     raise ValueError("a raiz do ficheiro não é en-export")
@@ -435,6 +596,7 @@ def converter(origem, pasta_destino=None, emitir=consola, markdown=False):
                 elem.clear()
                 pilha[0].remove(elem)
             pilha.pop()
+    emitir("relatorio", f"Notas reparadas: {stats[0]}; fragmentos por recuperar: {stats[1]}.")
     parcial.rename(destino)
     emitir("relatorio", f"{destino}: {notas} notas, {total_anexos} anexos, {avisos} avisos.")
     return notas, total_anexos, avisos
@@ -460,7 +622,7 @@ def listar_entradas(caminhos):
 def converter_lote(entradas, destino=None, emitir=consola, markdown=False):
     notas = anexos = avisos = falhas = 0
     for indice, entrada in enumerate(entradas, 1):
-        emitir("inicio", f"[{indice}/{len(entradas)}] v1.2 · A converter {entrada}")
+        emitir("inicio", f"[{indice}/{len(entradas)}] v1.5 · A converter {entrada}")
         try:
             n, a, v = converter(entrada, destino, emitir, markdown)
             notas += n
@@ -490,7 +652,7 @@ class JanelaConversao:
         self.selecao = tk.StringVar(value="Nenhuma origem selecionada")
         self.destino = tk.StringVar()
         self.estado = tk.StringVar(value="Selecione os ficheiros ou a pasta de entrada.")
-        raiz.title("Evernote · Conversor ENEX para HTML · v1.2")
+        raiz.title("Evernote · Conversor ENEX para HTML · v1.5")
         raiz.minsize(620, 440)
         raiz.protocol("WM_DELETE_WINDOW", self.fechar)
         painel = ttk.Frame(raiz, padding=16)
