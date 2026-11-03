@@ -88,6 +88,9 @@ def extrair(recurso, pasta, nomes):
     base, ext = os.path.splitext(original)
     if len(ext.encode("utf-8")) > 32:
         base, ext = original, ""
+    if len(original.encode("utf-8")) > min(120, nomes.limit):
+        suffix = hashlib.sha256(original.encode("utf-8")).hexdigest()[:12]
+        base = f"anexo-{suffix}"
     nome = nomes.reservar(base, ext or EXTENSOES.get(mime, ".bin"))
     destino = pasta / nome
     digest = hashlib.md5()  # Identificador de conteúdo usado pelo ENML.
@@ -282,7 +285,7 @@ def listar_entradas(caminhos):
 def converter_lote(entradas, destino=None, emitir=consola):
     notas = anexos = avisos = falhas = 0
     for indice, entrada in enumerate(entradas, 1):
-        emitir("inicio", f"[{indice}/{len(entradas)}] A converter {entrada}")
+        emitir("inicio", f"[{indice}/{len(entradas)}] v1.2 · A converter {entrada}")
         try:
             n, a, v = converter(entrada, destino, emitir)
             notas += n
@@ -312,7 +315,7 @@ class JanelaConversao:
         self.selecao = tk.StringVar(value="Nenhuma origem selecionada")
         self.destino = tk.StringVar()
         self.estado = tk.StringVar(value="Selecione os ficheiros ou a pasta de entrada.")
-        raiz.title("Evernote · Conversor ENEX para HTML")
+        raiz.title("Evernote · Conversor ENEX para HTML · v1.2")
         raiz.minsize(620, 440)
         raiz.protocol("WM_DELETE_WINDOW", self.fechar)
         painel = ttk.Frame(raiz, padding=16)
