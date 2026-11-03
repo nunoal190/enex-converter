@@ -223,6 +223,30 @@ def markdown_text(value):
     return re.sub(r"([\\\[\]*_])", r"\\\1", re.sub(r"\s+", " ", value or ""))
 
 
+def write_embedded_markdown(output, title, body, images, directory):
+    # XML cannot contain NUL. Use temporary tokens to stream Base64 after formatting.
+    sources = {url_anexo(name): (name, mime) for name, mime in images.items()}
+    embedded = []
+    for image in body.iter("img"):
+        source = sources.get(image.get("src"))
+        if source:
+            image.set("src", f"\x00{len(embedded)}\x00")
+            embedded.append(source)
+    text = markdown_body(body).strip()
+    output.write("# " + markdown_text(title) + "\n\n")
+    start = 0
+    for token in re.finditer(r"\x00(\d+)\x00", text):
+        output.write(text[start:token.start()])
+        name, mime = embedded[int(token[1])]
+        output.write(f"data:{mime};base64,")
+        with (directory / name).open("rb") as image:
+            # Multiples of three produce one continuous Base64 stream.
+            for block in iter(lambda: image.read(3 * 65536), b""):
+                output.write(base64.b64encode(block).decode("ascii"))
+        start = token.end()
+    output.write(text[start:] + "\n")
+
+
 def markdown_body(node):
     tag = node.tag
     if tag in ("style", "script"):
@@ -258,7 +282,7 @@ def markdown_body(node):
     value = markdown_text(node.text) + "".join(markdown_body(child) + markdown_text(child.tail) for child in node)
     if tag == "img":
         url = node.get("src", "")
-        return f"![{url}]({url})"
+        return f"![{markdown_text(node.get('alt', ''))}]({url})"
     if tag == "a" and node.get("href"):
         url = node.get("href").replace(" ", "%20").replace("(", "%28").replace(")", "%29")
         label = re.sub(r"^📎 (?:Anexo|Attachment): ", "📎 ", value)
@@ -300,6 +324,7 @@ def escrever_nota(nota, recursos, pasta, nomes, avisar, markdown=False):
     corpo.tag = "div"
     usados = set()
     por_hash = dict(recursos)
+    images = {}
     for media in corpo.iter("en-media"):
         chave = media.get("hash", "").strip().lower()
         tipo = media.get("type", "").lower()
@@ -314,19 +339,26 @@ def escrever_nota(nota, recursos, pasta, nomes, avisar, markdown=False):
         nome, mime = por_hash[chave]
         usados.add(nome)
         if (mime or tipo).startswith("image/"):
+            images[nome] = mime or tipo
             media.tag = "img"
             media.attrib = {"src": url_anexo(nome), "alt": nome,
                             "style": "max-width:100%; height:auto;"}
         else:
             ligacao(media, nome)
-    for _, (nome, _) in recursos:
+    for _, (nome, mime) in recursos:
         if nome not in usados:
+            if markdown and mime.startswith("image/"):
+                images[nome] = mime
+                ET.SubElement(corpo, "img", src=url_anexo(nome), alt=nome)
+                continue
             ligacao(ET.SubElement(ET.SubElement(corpo, "p"), "a"), nome)
     render_tasks(corpo, nota)
     if markdown:
         caminho = pasta / nomes.reservar(seguro(titulo, "Sem título"), ".md")
         with caminho.open("x", encoding="utf-8") as output:
-            output.write("# " + markdown_text(titulo) + "\n\n" + markdown_body(corpo).strip() + "\n")
+            write_embedded_markdown(output, titulo, corpo, images, pasta / "_anexos")
+        for image_name in images:
+            (pasta / "_anexos" / image_name).unlink()
         return caminho.name
 
 
